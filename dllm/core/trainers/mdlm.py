@@ -28,6 +28,13 @@ class MDLMConfig(TrainingArguments):
     loss_weight_type: str = "scheduler"  # "scheduler", "uniform"
     loss_norm_type: str = "token"  # "batch", "sequence", "token"
     right_shift_logits: bool = False
+    # Chunk size (in tokens) for the cross-entropy over the sequence. The full
+    # [b, l, V] logits still come out of the lm-head, but F.cross_entropy upcasts
+    # to fp32 and would otherwise allocate one [b*l, V] fp32 log-softmax buffer
+    # (~14 GiB at l~28K, V~126K) -- the tensor that OOMs at long ctx + large
+    # vocab. Splitting the CE into chunks caps that buffer at [chunk, V]. Set 0
+    # to disable (single full-sequence cross-entropy).
+    loss_chunk_size: int = 2048
 
 
 class MDLMTrainer(transformers.Trainer):
@@ -49,6 +56,7 @@ class MDLMTrainer(transformers.Trainer):
         self.loss_weight_type = args.loss_weight_type
         self.loss_norm_type = args.loss_norm_type
         self.right_shift_logits = args.right_shift_logits
+        self.loss_chunk_size = args.loss_chunk_size
 
         self.meter = OnEvaluateMetricsCallback(
             trainer=self,
@@ -114,6 +122,37 @@ class MDLMTrainer(transformers.Trainer):
             labels = labels.detach().contiguous()
 
         return (loss.detach(), logits, labels)
+
+    def _token_cross_entropy(
+        self, logits: torch.Tensor, targets: torch.Tensor
+    ) -> torch.Tensor:
+        """Per-token cross-entropy returned as a [b, l] tensor.
+
+        When ``loss_chunk_size > 0`` the sequence is split into chunks so that
+        F.cross_entropy only allocates an fp32 log-softmax buffer of shape
+        [chunk, V] instead of [b*l, V]. The chunk outputs stay differentiable,
+        so backward is unchanged. ``logits`` is [b, l, V] and contiguous out of
+        the lm-head, so ``reshape(-1, V)`` is a free view (no transpose copy).
+        """
+        b, l, V = logits.shape
+        flat_logits = logits.reshape(-1, V)  # [b*l, V]
+        flat_targets = targets.reshape(-1)  # [b*l]
+        chunk = self.loss_chunk_size
+        if chunk and 0 < chunk < flat_logits.size(0):
+            flat_nll = torch.cat(
+                [
+                    F.cross_entropy(
+                        flat_logits[s : s + chunk],
+                        flat_targets[s : s + chunk],
+                        reduction="none",
+                    )
+                    for s in range(0, flat_logits.size(0), chunk)
+                ],
+                dim=0,
+            )
+        else:
+            flat_nll = F.cross_entropy(flat_logits, flat_targets, reduction="none")
+        return flat_nll.view(b, l)
 
     def compute_loss(
         self,
@@ -184,11 +223,7 @@ class MDLMTrainer(transformers.Trainer):
             input_ids[maskable_mask] == labels[maskable_mask]
         ).all(), "Mismatch between input_ids and labels at valid positions"
 
-        token_nll = F.cross_entropy(
-            logits.transpose(1, 2),  # [b, V, l]
-            input_ids,  # [b, l]
-            reduction="none",  # [b, l]
-        )
+        token_nll = self._token_cross_entropy(logits, input_ids)  # [b, l]
         token_nll = token_nll * loss_weights * masked_mask.to(token_nll.dtype)  # [b, l]
 
         self.meter.update(
